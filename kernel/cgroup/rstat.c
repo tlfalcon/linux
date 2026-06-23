@@ -10,7 +10,7 @@
 
 #include <trace/events/cgroup.h>
 
-static DEFINE_SPINLOCK(rstat_base_lock);
+static DEFINE_SEQLOCK(rstat_base_lock);
 static DEFINE_PER_CPU(struct llist_head, rstat_backlog_list);
 
 static void cgroup_base_stat_flush(struct cgroup *cgrp, int cpu);
@@ -38,7 +38,7 @@ static struct cgroup_rstat_base_cpu *cgroup_rstat_base_cpu(
 	return per_cpu_ptr(cgrp->rstat_base_cpu, cpu);
 }
 
-static spinlock_t *ss_rstat_lock(struct cgroup_subsys *ss)
+static seqlock_t *ss_rstat_lock(struct cgroup_subsys *ss)
 {
 	if (ss)
 		return &ss->rstat_ss_lock;
@@ -369,14 +369,16 @@ static inline void __css_rstat_lock(struct cgroup_subsys_state *css,
 	__acquires(ss_rstat_lock(css->ss))
 {
 	struct cgroup *cgrp = css->cgroup;
-	spinlock_t *lock;
+	seqlock_t *lock;
 	bool contended;
 
 	lock = ss_rstat_lock(css->ss);
-	contended = !spin_trylock_irq(lock);
+	contended = !spin_trylock_irq(&lock->lock);
 	if (contended) {
 		trace_cgroup_rstat_lock_contended(cgrp, cpu_in_loop, contended);
-		spin_lock_irq(lock);
+		write_seqlock_irq(lock);
+	} else {
+		do_write_seqcount_begin(&lock->seqcount.seqcount);
 	}
 	trace_cgroup_rstat_locked(cgrp, cpu_in_loop, contended);
 }
@@ -386,11 +388,11 @@ static inline void __css_rstat_unlock(struct cgroup_subsys_state *css,
 	__releases(ss_rstat_lock(css->ss))
 {
 	struct cgroup *cgrp = css->cgroup;
-	spinlock_t *lock;
+	seqlock_t *lock;
 
 	lock = ss_rstat_lock(css->ss);
 	trace_cgroup_rstat_unlock(cgrp, cpu_in_loop, false);
-	spin_unlock_irq(lock);
+	write_sequnlock_irq(lock);
 }
 
 /**
@@ -534,7 +536,7 @@ int __init ss_rstat_init(struct cgroup_subsys *ss)
 			return -ENOMEM;
 	}
 
-	spin_lock_init(ss_rstat_lock(ss));
+	seqlock_init(ss_rstat_lock(ss));
 	for_each_possible_cpu(cpu)
 		init_llist_head(ss_lhead_cpu(ss, cpu));
 
@@ -725,12 +727,15 @@ void cgroup_base_stat_cputime_show(struct seq_file *seq)
 	struct cgroup_base_stat bstat;
 
 	if (cgroup_parent(cgrp)) {
+		unsigned int seqno;
+
 		css_rstat_flush(&cgrp->self);
-		__css_rstat_lock(&cgrp->self, -1);
-		bstat = cgrp->bstat;
-		cputime_adjust(&cgrp->bstat.cputime, &cgrp->prev_cputime,
+		do {
+			seqno = read_seqbegin(ss_rstat_lock(cgrp->self.ss));
+			bstat = cgrp->bstat;
+		} while (read_seqretry(ss_rstat_lock(cgrp->self.ss), seqno));
+		cputime_adjust(&bstat.cputime, &cgrp->prev_cputime,
 			       &bstat.cputime.utime, &bstat.cputime.stime);
-		__css_rstat_unlock(&cgrp->self, -1);
 	} else {
 		root_cgroup_cputime(&bstat);
 	}
